@@ -122,8 +122,11 @@ router.post('/', (req, res) => {
     blind_plates.forEach(plate => {
       insertPlate.run(
         uuidv4(), id, plate.plate_no, plate.location,
-        plate.pipeline_name, plate.medium
+        plate.pipeline_name, plate.medium || ''
       );
+      db.prepare(`
+        UPDATE isolation_blind_plates SET installed = 0 WHERE ticket_id = ? AND plate_no = ?
+      `).run(id, plate.plate_no);
     });
 
     const insertPerson = db.prepare(`
@@ -143,8 +146,24 @@ router.post('/', (req, res) => {
   });
 
   tx();
+
+  const blindPlates = db.prepare(
+    'SELECT * FROM isolation_blind_plates WHERE ticket_id = ? ORDER BY created_at'
+  ).all(id);
+
+  const responsiblePersons = db.prepare(
+    'SELECT * FROM responsible_persons WHERE ticket_id = ? ORDER BY created_at'
+  ).all(id);
+
   const ticket = db.prepare('SELECT * FROM work_tickets WHERE id = ?').get(id);
-  res.status(201).json(ticket);
+
+  res.status(201).json({
+    ...ticket,
+    blindPlates,
+    detections: [],
+    responsiblePersons,
+    pauseRecords: []
+  });
 });
 
 router.post('/:id/issue', (req, res) => {
@@ -224,6 +243,8 @@ router.get('/:id/check-interlock', (req, res) => {
     SELECT * FROM isolation_blind_plates WHERE ticket_id = ? AND installed = 0
   `).all(req.params.id);
 
+  const unconfirmedCount = unconfirmedPlates.length;
+
   const latestDetection = db.prepare(`
     SELECT * FROM gas_detections WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1
   `).get(req.params.id);
@@ -232,14 +253,17 @@ router.get('/:id/check-interlock', (req, res) => {
   let reasons = [];
   let isPaused = ticket.status === TICKET_STATUS.PAUSED;
   let isLocked = false;
+  let retestLocked = false;
   let lockReason = null;
+  let overdueMinutes = 0;
 
-  if (unconfirmedPlates.length > 0) {
+  if (unconfirmedCount > 0) {
     canIssue = false;
     reasons.push(`隔离盲板未确认: ${unconfirmedPlates.map(p => p.plate_no).join(', ')}`);
   }
 
-  if (!latestDetection || !latestDetection.is_qualified) {
+  const gasQualified = !!(latestDetection && latestDetection.is_qualified);
+  if (!gasQualified) {
     canIssue = false;
     reasons.push(latestDetection ? '最近一次气体检测不合格' : '尚未进行气体检测');
   }
@@ -249,10 +273,12 @@ router.get('/:id/check-interlock', (req, res) => {
     const detectionTime = new Date(latestDetection.created_at).getTime();
     const interval = (now - detectionTime) / (1000 * 60);
     const maxInterval = ticket.retest_interval || 30;
+    overdueMinutes = Math.max(0, Math.round(interval - maxInterval));
 
     if (interval > maxInterval) {
       isLocked = true;
-      lockReason = `已超过复测间隔 ${Math.round(interval - maxInterval)} 分钟，请立即进行气体复测`;
+      retestLocked = true;
+      lockReason = `已超过复测间隔 ${overdueMinutes} 分钟，请立即进行气体复测`;
       db.prepare(`
         UPDATE work_tickets SET locked_reason = ? WHERE id = ?
       `).run(lockReason, req.params.id);
@@ -261,11 +287,18 @@ router.get('/:id/check-interlock', (req, res) => {
 
   res.json({
     canIssue,
+    can_issue: canIssue,
+    can_resume: !isLocked && !isPaused && gasQualified,
     isPaused,
     isLocked,
+    retest_locked: retestLocked,
     reasons,
     lockReason: lockReason || ticket.locked_reason,
-    ticketStatus: ticket.status
+    ticketStatus: ticket.status,
+    isolation_ready: unconfirmedCount === 0,
+    unconfirmed_plate_count: unconfirmedCount,
+    gas_qualified: gasQualified,
+    overdue_minutes: overdueMinutes
   });
 });
 

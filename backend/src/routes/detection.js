@@ -54,15 +54,23 @@ router.get('/ticket/:ticketId/curve', (req, res) => {
 router.post('/ticket/:ticketId', (req, res) => {
   const {
     detection_point,
+    detectionPoint,
     combustible_content,
+    combustible_gas,
     oxygen_content,
     detector,
+    detector_name,
     detector_role = 'safety_guardian',
     remark
   } = req.body;
 
-  if (!detection_point || combustible_content === undefined || oxygen_content === undefined) {
-    return res.status(400).json({ error: '检测点、可燃气体含量、氧含量为必填项' });
+  const point = detection_point || detectionPoint || '默认检测点';
+  const combustible = combustible_content !== undefined ? combustible_content : combustible_gas;
+  const oxygen = oxygen_content;
+  const detectorName = detector_name || detector;
+
+  if (combustible === undefined || oxygen === undefined) {
+    return res.status(400).json({ error: '可燃气体含量、氧含量为必填项' });
   }
 
   const ticket = db.prepare('SELECT * FROM work_tickets WHERE id = ?').get(req.params.ticketId);
@@ -71,9 +79,9 @@ router.post('/ticket/:ticketId', (req, res) => {
   }
 
   const isQualified =
-    combustible_content < ticket.combustible_limit &&
-    oxygen_content >= ticket.oxygen_min &&
-    oxygen_content <= ticket.oxygen_max;
+    combustible < ticket.combustible_limit &&
+    oxygen >= ticket.oxygen_min &&
+    oxygen <= ticket.oxygen_max;
 
   const id = uuidv4();
   const tx = db.transaction(() => {
@@ -83,10 +91,10 @@ router.post('/ticket/:ticketId', (req, res) => {
         oxygen_content, detector, detector_role, is_qualified, remark
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      id, req.params.ticketId, detection_point,
-      parseFloat(combustible_content),
-      parseFloat(oxygen_content),
-      detector || 'safety_guardian_user',
+      id, req.params.ticketId, point,
+      parseFloat(combustible),
+      parseFloat(oxygen),
+      detectorName || detector || 'safety_guardian_user',
       detector_role,
       isQualified ? 1 : 0,
       remark || ''
@@ -99,7 +107,7 @@ router.post('/ticket/:ticketId', (req, res) => {
           gas_qualified_by = ?,
           locked_reason = NULL
         WHERE id = ?
-      `).run(detector || 'safety_guardian_user', req.params.ticketId);
+      `).run(detectorName || detector || 'safety_guardian_user', req.params.ticketId);
 
       if (ticket.status === 'pending_detection') {
         const unconfirmed = db.prepare(`
@@ -133,7 +141,7 @@ router.post('/ticket/:ticketId', (req, res) => {
       `).run(
         uuidv4(), req.params.ticketId,
         'auto_gas_exceed',
-        `气体检测超限：可燃 ${combustible_content}% LEL / 氧 ${oxygen_content}%`,
+        `气体检测超限：可燃 ${combustible}% LEL / 氧 ${oxygen}%`,
         'system'
       );
     }
@@ -143,8 +151,8 @@ router.post('/ticket/:ticketId', (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(
       uuidv4(), req.params.ticketId, 'gas_detection',
-      detector || 'safety_guardian_user', detector_role,
-      `气体检测：${detection_point} 可燃${combustible_content}% 氧${oxygen_content}% ${isQualified ? '合格' : '不合格'}`
+      detectorName || detector || 'safety_guardian_user', detector_role,
+      `气体检测：${point} 可燃${combustible}% 氧${oxygen}% ${isQualified ? '合格' : '不合格'}`
     );
   });
 
@@ -157,7 +165,8 @@ router.post('/ticket/:ticketId', (req, res) => {
     detection,
     ticket_status: updatedTicket.status,
     is_qualified: isQualified,
-    auto_paused: !isQualified && (ticket.status === 'in_progress' || ticket.status === 'ready')
+    auto_paused: !isQualified && (ticket.status === 'in_progress' || ticket.status === 'ready'),
+    ticket_id: ticket.id
   });
 });
 

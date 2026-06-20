@@ -18,6 +18,35 @@ const defaultData = {
   pause_records: [],
 };
 
+const COLUMN_DEFAULTS = {
+  work_tickets: {
+    status: 'draft',
+    retest_interval: 30,
+    combustible_limit: 0.5,
+    oxygen_min: 19.5,
+    oxygen_max: 23.5,
+  },
+  isolation_blind_plates: {
+    installed: 0,
+    removed: 0,
+    confirmed_by: null,
+    confirmed_at: null,
+  },
+  gas_detections: {
+    is_qualified: 1,
+    remark: '',
+  },
+  responsible_persons: {
+    confirmed_at: null,
+    signature: null,
+  },
+  pause_records: {
+    resumed_at: null,
+    resumed_by: null,
+    resume_remark: '',
+  },
+};
+
 function readDB() {
   if (!fs.existsSync(dbFile)) {
     return JSON.parse(JSON.stringify(defaultData));
@@ -47,6 +76,219 @@ function initDatabase() {
   return db;
 }
 
+function normalizeValueForCompare(val) {
+  if (val === undefined || val === null) return 0;
+  if (typeof val === 'boolean') return val ? 1 : 0;
+  if (typeof val === 'number') return val;
+  if (typeof val === 'string') {
+    const n = Number(val);
+    if (!isNaN(n) && val.trim() !== '') return n;
+    return val;
+  }
+  return val;
+}
+
+function parseWhereClause(whereStr, params) {
+  if (!whereStr || !whereStr.trim()) {
+    return () => true;
+  }
+
+  const tokens = whereStr.trim();
+  const conditions = [];
+  let paramIndex = 0;
+
+  const parts = [];
+  let depth = 0;
+  let buf = '';
+  const up = tokens.toUpperCase();
+  let i = 0;
+  while (i < tokens.length) {
+    if (up.substr(i, 4) === ' AND' && depth === 0) {
+      parts.push(buf.trim());
+      buf = '';
+      i += 4;
+      while (i < tokens.length && tokens[i] === ' ') i++;
+      continue;
+    }
+    if (tokens[i] === '(') depth++;
+    if (tokens[i] === ')') depth--;
+    buf += tokens[i];
+    i++;
+  }
+  if (buf.trim()) parts.push(buf.trim());
+
+  parts.forEach(part => {
+    if (!part) return;
+    if (part === '1=1' || part.toUpperCase() === '1=1') {
+      conditions.push({ type: 'always_true' });
+      return;
+    }
+
+    const likeMatch = part.match(/^(\w+)\s+LIKE\s+(\?|'[^']*')$/i);
+    if (likeMatch) {
+      const col = likeMatch[1];
+      let pattern;
+      if (likeMatch[2] === '?') {
+        pattern = params[paramIndex++];
+      } else {
+        pattern = likeMatch[2].slice(1, -1);
+      }
+      const regex = new RegExp('^' + String(pattern).split('%').join('.*') + '$', 'i');
+      conditions.push({
+        type: 'like',
+        column: col,
+        test: (val) => regex.test(String(val || ''))
+      });
+      return;
+    }
+
+    const isNullMatch = part.match(/^(\w+)\s+IS\s+NULL$/i);
+    if (isNullMatch) {
+      const col = isNullMatch[1];
+      conditions.push({
+        type: 'isnull',
+        column: col,
+        test: (val) => val === undefined || val === null || val === ''
+      });
+      return;
+    }
+
+    const isNotNullMatch = part.match(/^(\w+)\s+IS\s+NOT\s+NULL$/i);
+    if (isNotNullMatch) {
+      const col = isNotNullMatch[1];
+      conditions.push({
+        type: 'isnotnull',
+        column: col,
+        test: (val) => val !== undefined && val !== null && val !== ''
+      });
+      return;
+    }
+
+    const neqMatch = part.match(/^(\w+)\s*(!=|<>)\s*\?$/i);
+    if (neqMatch) {
+      const col = neqMatch[1];
+      const expected = params[paramIndex++];
+      conditions.push({
+        type: 'neq',
+        column: col,
+        test: (val) => {
+          const a = normalizeValueForCompare(val);
+          const b = normalizeValueForCompare(expected);
+          return a !== b;
+        }
+      });
+      return;
+    }
+
+    const eqMatch = part.match(/^(\w+)\s*=\s*\?$/i);
+    if (eqMatch) {
+      const col = eqMatch[1];
+      const expected = params[paramIndex++];
+      conditions.push({
+        type: 'eq',
+        column: col,
+        test: (val) => {
+          const a = normalizeValueForCompare(val);
+          const b = normalizeValueForCompare(expected);
+          if (typeof a === 'number' && typeof b === 'number') return a === b;
+          return String(a) === String(b);
+        }
+      });
+      return;
+    }
+
+    const gtMatch = part.match(/^(\w+)\s*(>|<|>=|<=)\s*\?$/i);
+    if (gtMatch) {
+      const col = gtMatch[1];
+      const op = gtMatch[2];
+      const expected = params[paramIndex++];
+      conditions.push({
+        type: 'compare',
+        column: col,
+        test: (val) => {
+          const a = normalizeValueForCompare(val);
+          const b = normalizeValueForCompare(expected);
+          switch (op) {
+            case '>': return a > b;
+            case '<': return a < b;
+            case '>=': return a >= b;
+            case '<=': return a <= b;
+          }
+          return false;
+        }
+      });
+      return;
+    }
+
+    const literalNumMatch = part.match(/^(\w+)\s*(!=|<>|>=|<=|>|<|=)\s*(-?\d+(?:\.\d+)?)$/i);
+    if (literalNumMatch) {
+      const col = literalNumMatch[1];
+      const op = literalNumMatch[2];
+      const expected = Number(literalNumMatch[3]);
+      conditions.push({
+        type: 'compare',
+        column: col,
+        test: (val) => {
+          const a = normalizeValueForCompare(val);
+          const b = expected;
+          switch (op) {
+            case '=': return a === b;
+            case '!=': case '<>': return a !== b;
+            case '>': return a > b;
+            case '<': return a < b;
+            case '>=': return a >= b;
+            case '<=': return a <= b;
+          }
+          return false;
+        }
+      });
+      return;
+    }
+
+    const literalStrMatch = part.match(/^(\w+)\s*=\s*'([^']*)'$/i);
+    if (literalStrMatch) {
+      const col = literalStrMatch[1];
+      const expected = literalStrMatch[2];
+      conditions.push({
+        type: 'eq',
+        column: col,
+        test: (val) => String(val || '') === expected
+      });
+      return;
+    }
+
+    const resumedAtIsNull = part.match(/^(\w+)\s+IS\s+NULL$/i);
+    if (!resumedAtIsNull) {
+      conditions.push({ type: 'always_true' });
+    }
+  });
+
+  return (row) => {
+    for (const cond of conditions) {
+      if (cond.type === 'always_true') continue;
+      const val = row[cond.column];
+      if (!cond.test(val)) return false;
+    }
+    return true;
+  };
+}
+
+function parseColumns(selectStr) {
+  if (selectStr.trim() === '*') {
+    return null;
+  }
+  if (/COUNT\(\s*(?:\*|\w+)\s*\)/i.test(selectStr)) {
+    return { type: 'count' };
+  }
+  const cols = selectStr.split(',').map(s => {
+    const asMatch = s.match(/\s+AS\s+(\w+)$/i);
+    if (asMatch) return asMatch[1];
+    const parts = s.trim().split(/\s+/);
+    return parts[parts.length - 1];
+  });
+  return { type: 'columns', cols };
+}
+
 class Table {
   constructor(tableName) {
     this.tableName = tableName;
@@ -71,9 +313,19 @@ class Table {
 
   insert(record) {
     const data = readDB();
-    const rec = { ...record };
+    const defaults = COLUMN_DEFAULTS[this.tableName] || {};
+    const rec = { ...defaults, ...record };
     if (!rec.id) rec.id = uuidv4();
     if (!rec.created_at) rec.created_at = new Date().toISOString();
+
+    if (this.tableName === 'isolation_blind_plates') {
+      rec.installed = normalizeValueForCompare(rec.installed);
+      rec.removed = normalizeValueForCompare(rec.removed);
+    }
+    if (this.tableName === 'gas_detections' && rec.is_qualified !== undefined) {
+      rec.is_qualified = normalizeValueForCompare(rec.is_qualified);
+    }
+
     data[this.tableName].push(rec);
     writeDB(data);
     return rec;
@@ -101,20 +353,6 @@ class Table {
     writeDB(data);
     return count;
   }
-
-  runInsert(sql, params) {
-    const record = {};
-    params.forEach((v, i) => {
-      if (i < 20) {
-        const colMatch = sql.match(/INSERT INTO \w+ \(([^)]+)\)/);
-        if (colMatch) {
-          const cols = colMatch[1].split(',').map(s => s.trim());
-          record[cols[i]] = v;
-        }
-      }
-    });
-    return this.insert(record);
-  }
 }
 
 const tables = {
@@ -129,104 +367,169 @@ const tables = {
 const db = {
   prepare(sql) {
     const trimmed = sql.trim();
+    const upperSql = trimmed.toUpperCase();
 
-    if (trimmed.toUpperCase().startsWith('SELECT')) {
-      const whereMatch = trimmed.match(/WHERE (.+?)(?: ORDER | LIMIT |$)/is);
-      const orderMatch = trimmed.match(/ORDER BY (.+?)(?: LIMIT |$)/is);
-      const limitMatch = trimmed.match(/LIMIT (\d+)/i);
-      const tableMatch = trimmed.match(/FROM (\w+)/i);
-      const tableName = tableMatch ? tableMatch[1] : null;
+    if (upperSql.startsWith('SELECT')) {
+      const selectMatch = trimmed.match(/^SELECT\s+(.+?)\s+FROM\s+(\w+)/is);
+      if (!selectMatch) {
+        return { all: () => [], get: () => undefined, run: () => ({ changes: 0 }) };
+      }
+
+      const columnsPart = selectMatch[1];
+      const tableName = selectMatch[2];
+      const colInfo = parseColumns(columnsPart);
+
+      const whereMatch = trimmed.match(/WHERE\s+(.+?)(?:\s+ORDER\s+BY|\s+LIMIT\s|$)/is);
+      const orderMatch = trimmed.match(/ORDER\s+BY\s+(.+?)(?:\s+LIMIT\s|$)/is);
+      const limitMatch = trimmed.match(/LIMIT\s+(\d+)/i);
 
       return {
         all(...params) {
-          if (!tableName || !tables[tableName]) return [];
-          let result = tables[tableName].all();
+          if (!tables[tableName]) return [];
+
+          const whereStr = whereMatch ? whereMatch[1] : '';
+          const whereFn = parseWhereClause(whereStr, params);
+
+          let result = tables[tableName].all().filter(row => whereFn(row));
+
           if (orderMatch) {
             const orderStr = orderMatch[1].trim();
-            const [col, dir] = orderStr.split(/\s+/);
+            const parts = orderStr.split(',');
             result.sort((a, b) => {
-              if (a[col] === b[col]) return 0;
-              const cmp = a[col] > b[col] ? 1 : -1;
-              return (dir && dir.toUpperCase() === 'DESC') ? -cmp : cmp;
+              for (const p of parts) {
+                const [col, dir] = p.trim().split(/\s+/);
+                const av = normalizeValueForCompare(a[col]);
+                const bv = normalizeValueForCompare(b[col]);
+                if (av !== bv) {
+                  let cmp = 0;
+                  if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
+                  else cmp = String(av) > String(bv) ? 1 : -1;
+                  return (dir && dir.toUpperCase() === 'DESC') ? -cmp : cmp;
+                }
+              }
+              return 0;
             });
           }
+
           if (limitMatch) {
             result = result.slice(0, parseInt(limitMatch[1]));
           }
+
+          if (colInfo && colInfo.type === 'count') {
+            return [{ count: result.length }];
+          }
+
+          if (colInfo && colInfo.type === 'columns') {
+            return result.map(row => {
+              const newRow = {};
+              colInfo.cols.forEach(c => { newRow[c] = row[c]; });
+              return newRow;
+            });
+          }
+
           return result;
         },
+
         get(...params) {
           const results = this.all(...params);
           return results[0] || undefined;
         },
+
         run(...params) {
           return { changes: this.all(...params).length };
         },
       };
     }
 
-    if (trimmed.toUpperCase().startsWith('UPDATE')) {
-      const tableMatch = trimmed.match(/UPDATE (\w+)/i);
-      const setMatch = trimmed.match(/SET (.+?) WHERE /is);
-      const whereMatch = trimmed.match(/WHERE (.+?)$/is);
+    if (upperSql.startsWith('UPDATE')) {
+      const tableMatch = trimmed.match(/UPDATE\s+(\w+)/i);
+      const setMatch = trimmed.match(/SET\s+(.+?)\s+WHERE\s+/is);
+      const whereMatch = trimmed.match(/WHERE\s+(.+?)$/is);
       const tableName = tableMatch ? tableMatch[1] : null;
 
       return {
         run(...params) {
           if (!tableName || !tables[tableName]) return { changes: 0 };
+
           const setStr = setMatch ? setMatch[1].trim() : '';
-          const sets = setStr.split(',').map(s => s.trim().split('=')[0].trim());
+          const setItems = [];
+          const commaParts = [];
+          let depth = 0;
+          let buf = '';
+          for (let i = 0; i < setStr.length; i++) {
+            const ch = setStr[i];
+            if (ch === ',' && depth === 0) {
+              commaParts.push(buf.trim());
+              buf = '';
+              continue;
+            }
+            if (ch === '(') depth++;
+            if (ch === ')') depth--;
+            buf += ch;
+          }
+          if (buf.trim()) commaParts.push(buf.trim());
+
+          commaParts.forEach(s => {
+            const idx = s.indexOf('=');
+            if (idx > 0) {
+              setItems.push({
+                col: s.substring(0, idx).trim(),
+                val: s.substring(idx + 1).trim()
+              });
+            }
+          });
 
           let paramIdx = 0;
           const updates = {};
-          sets.forEach((col, i) => {
-            updates[col] = params[paramIdx++];
+          setItems.forEach(item => {
+            if (item.val === '?') {
+              updates[item.col] = params[paramIdx++];
+            } else if (/^CURRENT_TIMESTAMP$/i.test(item.val.trim())) {
+              updates[item.col] = new Date().toISOString();
+            } else if (/^NULL$/i.test(item.val.trim())) {
+              updates[item.col] = null;
+            } else if (item.val.startsWith("'") && item.val.endsWith("'")) {
+              updates[item.col] = item.val.slice(1, -1);
+            } else if (!isNaN(Number(item.val)) && item.val.trim() !== '') {
+              updates[item.col] = Number(item.val);
+            } else {
+              updates[item.col] = item.val;
+            }
           });
 
           const whereStr = whereMatch ? whereMatch[1].trim() : '';
-          const hasIdEq = whereStr.includes('id = ?') || whereStr.includes('id=?');
-          const hasTicketEq = whereStr.includes('ticket_id = ?') || whereStr.includes('ticket_id=?');
+          const whereParams = params.slice(paramIdx);
+          const whereFn = parseWhereClause(whereStr, whereParams);
 
-          let count = 0;
-          if (hasIdEq && params.length - paramIdx >= 1) {
-            const id = params[paramIdx];
-            const updated = tables[tableName].update(id, updates);
-            count = updated ? 1 : 0;
-          } else if (hasTicketEq) {
-            const tid = params[paramIdx];
-            count = tables[tableName].updateWhere(r => r.ticket_id === tid, updates);
-          } else {
-            count = tables[tableName].updateWhere(() => true, updates);
-          }
-
+          const count = tables[tableName].updateWhere(row => whereFn(row), updates);
           return { changes: count };
         },
       };
     }
 
-    if (trimmed.toUpperCase().startsWith('INSERT')) {
-      const tableMatch = trimmed.match(/INTO (\w+)/i);
-      const tableName = tableMatch ? tableMatch[1] : null;
-      const colsMatch = trimmed.match(/\(([^)]+)\)/);
-      const cols = colsMatch ? colsMatch[1].split(',').map(s => s.trim()) : [];
+    if (upperSql.startsWith('INSERT')) {
+      const tableMatch = trimmed.match(/INTO\s+(\w+)\s*\(([^)]+)\)/i);
+      const valuesMatch = trimmed.match(/VALUES\s*\(([^)]+)\)/i);
 
       return {
         run(...params) {
-          if (!tableName || !tables[tableName]) return { lastInsertRowid: null };
+          if (!tableMatch) return { lastInsertRowid: null };
+          const tableName = tableMatch[1];
+          if (!tables[tableName]) return { lastInsertRowid: null };
+
+          const cols = tableMatch[2].split(',').map(s => s.trim());
           const record = {};
           cols.forEach((col, i) => {
             record[col] = params[i];
           });
-          if (record.ticket_id === undefined && tableName !== 'work_tickets') {
-            record.ticket_id = '';
-          }
+
           const inserted = tables[tableName].insert(record);
           return { lastInsertRowid: inserted.id };
         },
       };
     }
 
-    if (trimmed.toUpperCase().startsWith('CREATE') || trimmed.toUpperCase().startsWith('PRAGMA')) {
+    if (upperSql.startsWith('CREATE') || upperSql.startsWith('PRAGMA')) {
       return { run: () => ({ changes: 0 }) };
     }
 
