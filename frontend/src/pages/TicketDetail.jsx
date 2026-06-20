@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react'
 import {
   Card, Descriptions, Tag, Button, Space, Table, Alert, Row, Col,
   Form, Input, InputNumber, Modal, message, Statistic, Divider, Badge,
+  Select,
 } from 'antd'
+const { Option } = Select
 import {
   CheckCircleOutlined, PauseCircleOutlined, SafetyCertificateOutlined,
   PlayCircleOutlined, ThunderboltOutlined, DashboardOutlined, LockOutlined,
