@@ -25,6 +25,15 @@ export const ticketApi = {
   issue: (id, data) => api.post(`/tickets/${id}/issue`, data),
   complete: (id, data) => api.post(`/tickets/${id}/complete`, data),
   checkInterlock: (id) => api.get(`/tickets/${id}/check-interlock`),
+  confirmResume: (id, data) => api.post(`/tickets/${id}/confirm-resume`, data),
+  unlock: (id, data) => api.post(`/tickets/${id}/unlock`, data),
+}
+
+export const pipelineApi = {
+  listByTicket: (ticketId) => api.get(`/pipelines/ticket/${ticketId}`),
+  addPipeline: (ticketId, data) => api.post(`/pipelines/ticket/${ticketId}/add`, data),
+  confirmPipeline: (pipelineId, data) => api.post(`/pipelines/${pipelineId}/confirm`, data),
+  deletePipeline: (pipelineId) => api.delete(`/pipelines/${pipelineId}`),
 }
 
 export const isolationApi = {

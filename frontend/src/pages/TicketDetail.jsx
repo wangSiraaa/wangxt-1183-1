@@ -2,35 +2,42 @@ import { useEffect, useState } from 'react'
 import {
   Card, Descriptions, Tag, Button, Space, Table, Alert, Row, Col,
   Form, Input, InputNumber, Modal, message, Statistic, Divider, Badge,
-  Select,
+  Select, Switch,
 } from 'antd'
 const { Option } = Select
 import {
   CheckCircleOutlined, PauseCircleOutlined, SafetyCertificateOutlined,
   PlayCircleOutlined, ThunderboltOutlined, DashboardOutlined, LockOutlined,
-  ArrowLeftOutlined, ExclamationCircleOutlined,
+  ArrowLeftOutlined, ExclamationCircleOutlined, AlertOutlined, UnlockOutlined,
+  RiseOutlined,
 } from '@ant-design/icons'
 import { useParams, useNavigate } from 'react-router-dom'
 import ReactECharts from 'echarts-for-react'
 import dayjs from 'dayjs'
 import {
-  ticketApi, isolationApi, detectionApi, pauseApi,
+  ticketApi, isolationApi, detectionApi, pauseApi, pipelineApi,
 } from '../services/api'
-import { STATUS_NAMES, STATUS_COLORS, ROLE_NAMES } from '../stores/appStore'
+import { STATUS_NAMES, STATUS_COLORS, ROLE_NAMES, LOCK_TYPE_NAMES, PRESSURE_STATUS_OPTIONS } from '../stores/appStore'
 import { formatDateTime, getMinutesSince } from '../utils/helpers'
 import useAppStore from '../stores/appStore'
 
 function TicketDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { currentUser, currentRole } = useAppStore()
+  const { currentUser, currentRole, currentUserName } = useAppStore()
   const [ticket, setTicket] = useState(null)
   const [interlock, setInterlock] = useState(null)
   const [loading, setLoading] = useState(false)
   const [detectionModal, setDetectionModal] = useState(false)
   const [pauseModal, setPauseModal] = useState(false)
+  const [resumeModal, setResumeModal] = useState(false)
+  const [pipelineModal, setPipelineModal] = useState(false)
+  const [curveModal, setCurveModal] = useState(false)
+  const [selectedPauseRecord, setSelectedPauseRecord] = useState(null)
   const [detectionForm] = Form.useForm()
   const [pauseForm] = Form.useForm()
+  const [resumeForm] = Form.useForm()
+  const [pipelineForm] = Form.useForm()
 
   useEffect(() => {
     loadData()
@@ -63,18 +70,40 @@ function TicketDetail() {
     }
   }
 
+  const confirmPipeline = async (pipelineId, data) => {
+    try {
+      await pipelineApi.confirmPipeline(pipelineId, {
+        ...data,
+        confirmed_by: currentUser,
+      })
+      message.success('管线状态已确认')
+      loadData()
+    } catch (e) {
+      message.error(e.response?.data?.error || '确认失败')
+    }
+  }
+
   const handleAddDetection = async () => {
     try {
       setLoading(true)
       const values = await detectionForm.validateFields()
+      const isRetest = ticket.is_locked || (ticket.status === 'paused')
       const res = await detectionApi.addDetection(id, {
         ...values,
         detector: currentUser,
         detector_role: currentRole,
+        is_retest: isRetest ? 1 : 0,
       })
-      message.success(
-        res.data.is_qualified ? '气体检测合格' : (res.data.auto_paused ? '气体检测超限，作业已自动暂停！' : '气体检测不合格')
-      )
+      if (res.data.is_qualified && res.data.needs_resume_confirm) {
+        message.success('复测合格，请确认复工')
+        setResumeModal(true)
+      } else if (res.data.is_qualified) {
+        message.success('气体检测合格')
+      } else if (res.data.auto_paused) {
+        message.error('气体检测超限，作业已自动暂停并锁定！')
+      } else {
+        message.warning('气体检测不合格')
+      }
       setDetectionModal(false)
       detectionForm.resetFields()
       loadData()
@@ -83,6 +112,56 @@ function TicketDetail() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleConfirmResume = async () => {
+    try {
+      setLoading(true)
+      const values = await resumeForm.validateFields()
+      await ticketApi.confirmResume(id, {
+        ...values,
+        confirmed_by: currentUser,
+      })
+      message.success('复工确认成功，作业已恢复')
+      setResumeModal(false)
+      resumeForm.resetFields()
+      loadData()
+    } catch (e) {
+      message.error(e.response?.data?.error || '复工确认失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleUnlock = async () => {
+    Modal.confirm({
+      title: '确认人工解锁',
+      icon: <ExclamationCircleOutlined />,
+      content: '确定要人工解锁此作业票吗？此操作需要管理员权限，并会记录操作日志。',
+      okText: '确认解锁',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          setLoading(true)
+          await ticketApi.unlock(id, {
+            unlocked_by: currentUser,
+            unlock_reason: '管理员人工解锁',
+          })
+          message.success('作业票已解锁')
+          loadData()
+        } catch (e) {
+          message.error(e.response?.data?.error || '解锁失败')
+        } finally {
+          setLoading(false)
+        }
+      },
+    })
+  }
+
+  const showCurveModal = (pauseRecord) => {
+    setSelectedPauseRecord(pauseRecord)
+    setCurveModal(true)
   }
 
   const handleIssueTicket = async () => {
@@ -140,6 +219,19 @@ function TicketDetail() {
     }
   }
 
+  const reversedDetections = ticket.detections.slice().reverse()
+  const pausePoints = ticket.pauseRecords
+    .filter(p => p.pause_type === 'auto_gas_exceed')
+    .map(pause => {
+      const idx = reversedDetections.findIndex(d => new Date(d.created_at) <= new Date(pause.paused_at))
+      return idx >= 0 ? {
+        coord: [idx, reversedDetections[idx]?.combustible_content || ticket.combustible_limit],
+        value: '暂停',
+        itemStyle: { color: '#ff4d4f' },
+      } : null
+    })
+    .filter(Boolean)
+
   const curveOption = {
     title: { text: '气体检测趋势曲线', left: 'center' },
     tooltip: { trigger: 'axis' },
@@ -147,7 +239,7 @@ function TicketDetail() {
     grid: { left: 60, right: 60, top: 80, bottom: 60 },
     xAxis: {
       type: 'category',
-      data: ticket.detections.slice().reverse().map(d => formatDateTime(d.created_at).split(' ')[1]),
+      data: reversedDetections.map(d => formatDateTime(d.created_at).split(' ')[1]),
       axisLabel: { rotate: 30 },
     },
     yAxis: [
@@ -160,7 +252,10 @@ function TicketDetail() {
         type: 'line',
         smooth: true,
         yAxisIndex: 0,
-        data: ticket.detections.slice().reverse().map(d => d.combustible_content),
+        data: reversedDetections.map(d => ({
+          value: d.combustible_content,
+          itemStyle: d.is_retest ? { color: '#52c41a' } : undefined,
+        })),
         itemStyle: { color: '#ff4d4f' },
         areaStyle: { opacity: 0.2, color: '#ff4d4f' },
         markLine: {
@@ -168,13 +263,19 @@ function TicketDetail() {
           lineStyle: { color: '#ff4d4f', type: 'dashed' },
           data: [{ yAxis: ticket.combustible_limit, label: { formatter: `上限 ${ticket.combustible_limit}%` } }],
         },
+        markPoint: {
+          symbol: 'pin',
+          symbolSize: 40,
+          data: pausePoints,
+          label: { color: '#fff', fontWeight: 'bold' },
+        },
       },
       {
         name: '氧含量(%)',
         type: 'line',
         smooth: true,
         yAxisIndex: 1,
-        data: ticket.detections.slice().reverse().map(d => d.oxygen_content),
+        data: reversedDetections.map(d => d.oxygen_content),
         itemStyle: { color: '#1890ff' },
         areaStyle: { opacity: 0.2, color: '#1890ff' },
         markLine: {
@@ -214,9 +315,54 @@ function TicketDetail() {
     },
   ]
 
+  const pipelineColumns = [
+    { title: '管线名称', dataIndex: 'pipeline_name', width: 160 },
+    { title: '位置', dataIndex: 'location', width: 140 },
+    { title: '介质', dataIndex: 'medium', width: 120 },
+    {
+      title: '压力状态', dataIndex: 'pressure_status', width: 120,
+      render: v => {
+        const opt = PRESSURE_STATUS_OPTIONS.find(o => o.value === v)
+        return <Tag color={v === 'depressurized' ? 'green' : 'blue'}>{opt?.label || v}</Tag>
+      },
+    },
+    {
+      title: '泄漏情况', dataIndex: 'has_leak', width: 100,
+      render: v => <Tag color={v ? 'red' : 'green'}>{v ? '有泄漏' : '无泄漏'}</Tag>,
+    },
+    {
+      title: '状态', width: 100,
+      render: (_, r) => r.confirmed
+        ? <Tag color="green"><CheckCircleOutlined /> 已确认</Tag>
+        : <Badge status="warning" text="待确认" />,
+    },
+    {
+      title: '操作', width: 140,
+      render: (_, r) => !r.confirmed && (
+        <Button type="primary" size="small" icon={<CheckCircleOutlined />} onClick={() => {
+          pipelineForm.setFieldsValue({
+            pressure_status: r.pressure_status,
+            has_leak: r.has_leak ? 1 : 0,
+            remark: r.remark || '',
+          })
+          pipelineForm.pipelineId = r.id
+          setPipelineModal(true)
+        }}>
+          确认状态
+        </Button>
+      ),
+    },
+  ]
+
   const detectionColumns = [
     { title: '检测时间', dataIndex: 'created_at', width: 180, render: formatDateTime },
     { title: '检测点', dataIndex: 'detection_point', width: 120 },
+    {
+      title: '类型', width: 80,
+      render: (_, r) => r.is_retest
+        ? <Tag color="green">复测</Tag>
+        : <Tag color="blue">检测</Tag>,
+    },
     { title: '可燃气体', width: 110, render: (_, r) => `${r.combustible_content}% ${r.combustible_content >= ticket.combustible_limit ? '⚠️' : ''}` },
     { title: '氧含量', width: 110, render: (_, r) => `${r.oxygen_content}%` },
     { title: '检测人', dataIndex: 'detector', width: 150 },
@@ -289,6 +435,18 @@ function TicketDetail() {
         <Col xs={24} sm={12} md={6}>
           <Card className="stat-card" size="small">
             <Statistic
+              title="相邻管线状态"
+              value={`${ticket.adjacentPipelines?.filter(p => p.confirmed).length || 0}/${ticket.adjacentPipelines?.length || 0}`}
+              prefix={<AlertOutlined />}
+              valueStyle={{
+                color: (ticket.adjacentPipelines?.every(p => p.confirmed)) ? '#52c41a' : '#fa8c16',
+              }}
+            />
+          </Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card className="stat-card" size="small">
+            <Statistic
               title="最近气体检测"
               value={latestDetection ? (latestDetection.is_qualified ? '合格' : '不合格') : '未检测'}
               prefix={<DashboardOutlined />}
@@ -307,23 +465,16 @@ function TicketDetail() {
         <Col xs={24} sm={12} md={6}>
           <Card className="stat-card" size="small">
             <Statistic
-              title="联锁状态"
-              value={interlock?.canIssue ? '满足条件' : '不满足'}
-              prefix={<CheckCircleOutlined />}
-              valueStyle={{ color: interlock?.canIssue ? '#52c41a' : '#ff4d4f' }}
+              title="锁定状态"
+              value={ticket.is_locked ? (LOCK_TYPE_NAMES[ticket.lock_type] || '已锁定') : '未锁定'}
+              prefix={ticket.is_locked ? <LockOutlined /> : <UnlockOutlined />}
+              valueStyle={{ color: ticket.is_locked ? '#ff4d4f' : '#52c41a' }}
             />
-          </Card>
-        </Col>
-        <Col xs={24} sm={12} md={6}>
-          <Card className="stat-card" size="small">
-            <Statistic
-              title="施工时段"
-              value={dayjs(ticket.end_time).diff(dayjs(ticket.start_time), 'hour') + '小时'}
-              prefix={<SafetyCertificateOutlined />}
-            />
-            <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
-              {formatDateTime(ticket.start_time)}
-            </div>
+            {ticket.is_locked && (
+              <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
+                锁定时间: {formatDateTime(ticket.locked_at)}
+              </div>
+            )}
           </Card>
         </Col>
       </Row>
@@ -333,18 +484,34 @@ function TicketDetail() {
         title="基本信息"
         style={{ marginBottom: 16 }}
         extra={
-          <Space>
+          <Space wrap>
             {(ticket.status === 'ready') && (
-              <Button type="primary" icon={<PlayCircleOutlined />} loading={loading} onClick={handleIssueTicket}>
+              <Button
+                type="primary"
+                icon={<PlayCircleOutlined />}
+                loading={loading}
+                disabled={ticket.is_locked}
+                onClick={handleIssueTicket}
+              >
                 开具作业票并开工
               </Button>
             )}
-            {(ticket.status === 'in_progress' || ticket.status === 'ready') && (
+            {(ticket.status === 'in_progress' || ticket.status === 'ready') && !ticket.is_locked && (
               <Button type="primary" danger icon={<PauseCircleOutlined />} onClick={() => setPauseModal(true)}>
                 手动暂停
               </Button>
             )}
-            {ticket.status === 'paused' && (
+            {ticket.status === 'paused' && ticket.is_locked && (
+              <Button
+                type="primary"
+                icon={<RiseOutlined />}
+                loading={loading}
+                onClick={() => setResumeModal(true)}
+              >
+                确认复工
+              </Button>
+            )}
+            {ticket.status === 'paused' && !ticket.is_locked && (
               <Button type="primary" icon={<PlayCircleOutlined />} loading={loading} onClick={handleResume}>
                 恢复作业
               </Button>
@@ -353,16 +520,31 @@ function TicketDetail() {
               <Button
                 type="primary"
                 icon={<LockOutlined />}
-                disabled={isOverInterval}
-                onClick={() => message.info(isOverInterval ? '超过复测间隔，请先进行气体检测！' : '继续施工...')}
+                disabled={isOverInterval || ticket.is_locked}
+                onClick={() => {
+                  if (ticket.is_locked) {
+                    message.error('作业票已锁定，请先完成复工确认')
+                  } else if (isOverInterval) {
+                    message.error('超过复测间隔，请先进行气体检测！')
+                  } else {
+                    message.info('继续施工...')
+                  }
+                }}
               >
-                {isOverInterval ? '施工按钮已锁定' : '继续施工'}
+                {ticket.is_locked ? '已锁定' : (isOverInterval ? '施工按钮已锁定' : '继续施工')}
+              </Button>
+            )}
+            {ticket.is_locked && currentRole === 'admin' && (
+              <Button type="primary" danger icon={<UnlockOutlined />} loading={loading} onClick={handleUnlock}>
+                管理员解锁
               </Button>
             )}
             {(ticket.status === 'in_progress' || ticket.status === 'ready' || ticket.status === 'paused') && (
               <Button icon={<CheckCircleOutlined />} onClick={handleComplete}>完成作业</Button>
             )}
-            <Button icon={<DashboardOutlined />} onClick={() => setDetectionModal(true)}>录入气体检测</Button>
+            <Button icon={<DashboardOutlined />} onClick={() => setDetectionModal(true)}>
+              {ticket.is_locked || ticket.status === 'paused' ? '录入气体复测' : '录入气体检测'}
+            </Button>
           </Space>
         }
       >
@@ -380,9 +562,23 @@ function TicketDetail() {
           <Descriptions.Item label="隔离确认人" span={2}>
             {ticket.isolation_confirmed_by || '未确认'}（{formatDateTime(ticket.isolation_confirmed_at)}）
           </Descriptions.Item>
+          <Descriptions.Item label="管线确认人" span={2}>
+            {ticket.pipeline_confirmed_by || '未确认'}（{formatDateTime(ticket.pipeline_confirmed_at)}）
+          </Descriptions.Item>
           <Descriptions.Item label="气体检测人" span={2}>
             {ticket.gas_qualified_by || '未检测'}（{formatDateTime(ticket.gas_qualified_at)}）
           </Descriptions.Item>
+          {ticket.is_locked && (
+            <Descriptions.Item label="锁定原因" span={2}>
+              <Tag color="red">{LOCK_TYPE_NAMES[ticket.lock_type] || ticket.lock_type}</Tag>
+              {ticket.lock_reason && <span style={{ marginLeft: 8 }}>{ticket.lock_reason}</span>}
+            </Descriptions.Item>
+          )}
+          {ticket.resume_confirmed_by && (
+            <Descriptions.Item label="复工确认人" span={2}>
+              {ticket.resume_confirmed_by}（{formatDateTime(ticket.resume_confirmed_at)}）
+            </Descriptions.Item>
+          )}
         </Descriptions>
 
         <Divider>责任人</Divider>
@@ -415,10 +611,43 @@ function TicketDetail() {
           <ExclamationCircleOutlined style={{ color: ticket.blindPlates.every(b => b.installed) ? '#52c41a' : '#fa8c16' }} />
           <span style={{ marginLeft: 6 }}>
             {ticket.blindPlates.every(b => b.installed)
-              ? '所有盲板已确认安装，联锁条件已满足'
+              ? '所有盲板已确认安装'
               : '隔离盲板未全部确认，无法开具作业票！'}
           </span>
         </div>
+      </Card>
+
+      <Card
+        className="page-card"
+        title={<span><AlertOutlined /> 相邻管线状态确认（属地负责人）</span>}
+        style={{ marginBottom: 16, border: '2px solid #1890ff' }}
+      >
+        <p style={{ color: '#666', marginBottom: 12 }}>
+          请逐项确认相邻管线的压力状态和泄漏情况，所有管线确认完成后才能进入气体检测环节。
+        </p>
+        <Table
+          columns={pipelineColumns}
+          dataSource={ticket.adjacentPipelines || []}
+          rowKey="id"
+          pagination={false}
+          size="middle"
+        />
+        {ticket.adjacentPipelines?.length > 0 && (
+          <div style={{
+            marginTop: 12, padding: 12,
+            background: ticket.adjacentPipelines.every(p => p.confirmed) ? '#f6ffed' : '#e6f7ff',
+            borderRadius: 6,
+          }}>
+            <ExclamationCircleOutlined style={{
+              color: ticket.adjacentPipelines.every(p => p.confirmed) ? '#52c41a' : '#1890ff',
+            }} />
+            <span style={{ marginLeft: 6 }}>
+              {ticket.adjacentPipelines.every(p => p.confirmed)
+                ? '所有相邻管线状态已确认'
+                : `还有 ${ticket.adjacentPipelines.filter(p => !p.confirmed).length} 条管线需要确认状态`}
+            </span>
+          </div>
+        )}
       </Card>
 
       <Card
@@ -452,12 +681,19 @@ function TicketDetail() {
               padding: 12, border: '1px solid #ffccc7', borderRadius: 6,
               marginBottom: 12, background: '#fff1f0',
             }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <Space>
+              <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                <Space wrap style={{ marginBottom: 8 }}>
                   <Tag color={p.resumed_at ? 'green' : 'red'}>
                     {p.resumed_at ? '已恢复' : '暂停中'}
                   </Tag>
-                  <Tag color="orange">{p.pause_type === 'auto_gas_exceed' ? '自动暂停（气体超限）' : '手动暂停'}</Tag>
+                  <Tag color="orange">
+                    {p.pause_type === 'auto_gas_exceed' ? '自动暂停（气体超限）' : '手动暂停'}
+                  </Tag>
+                  {p.detection_curve_data && (
+                    <Button type="link" size="small" onClick={() => showCurveModal(p)}>
+                      <DashboardOutlined /> 查看检测曲线
+                    </Button>
+                  )}
                 </Space>
                 <div style={{ color: '#999', fontSize: 12 }}>
                   暂停人: {p.paused_by}
@@ -467,28 +703,49 @@ function TicketDetail() {
               <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
                 {formatDateTime(p.paused_at)} {p.resumed_at && `→ ${formatDateTime(p.resumed_at)}（${p.resumed_by}）`}
               </div>
+              {p.resume_confirmed_by && (
+                <div style={{ fontSize: 12, color: '#52c41a', marginTop: 4 }}>
+                  <CheckCircleOutlined /> 复工确认人: {p.resume_confirmed_by}（{formatDateTime(p.resume_confirmed_at)}）
+                </div>
+              )}
+              {p.retest_detection_id && (
+                <div style={{ fontSize: 12, color: '#1890ff', marginTop: 2 }}>
+                  关联复测记录: {p.retest_detection_id.substring(0, 8)}...
+                </div>
+              )}
             </div>
           ))
         )}
       </Card>
 
       <Modal
-        title="录入气体检测数据"
+        title={ticket.is_locked || ticket.status === 'paused' ? '录入气体复测数据' : '录入气体检测数据'}
         open={detectionModal}
         onCancel={() => setDetectionModal(false)}
         width={500}
         footer={[
           <Button key="cancel" onClick={() => setDetectionModal(false)}>取消</Button>,
-          <Button key="submit" type="primary" loading={loading} onClick={handleAddDetection}>提交检测</Button>,
+          <Button key="submit" type="primary" loading={loading} onClick={handleAddDetection}>
+            {ticket.is_locked || ticket.status === 'paused' ? '提交复测' : '提交检测'}
+          </Button>,
         ]}
       >
         <Alert
           style={{ marginBottom: 16 }}
-          message="检测标准"
+          message={ticket.is_locked || ticket.status === 'paused' ? '复测标准（复工前必须合格）' : '检测标准'}
           description={`可燃气体 < ${ticket.combustible_limit}% LEL，氧含量 ${ticket.oxygen_min}% ~ ${ticket.oxygen_max}%`}
-          type="info"
+          type={ticket.is_locked ? 'warning' : 'info'}
           showIcon
         />
+        {(ticket.is_locked || ticket.status === 'paused') && (
+          <Alert
+            style={{ marginBottom: 16 }}
+            message="复工流程"
+            description="复测合格后，需要监护人确认复工，作业票才能解除锁定并恢复作业。"
+            type="warning"
+            showIcon
+          />
+        )}
         <Form form={detectionForm} layout="vertical">
           <Form.Item label="检测点" name="detection_point" rules={[{ required: true, message: '请输入检测点' }]}>
             <Select placeholder="请选择检测点">
@@ -522,6 +779,208 @@ function TicketDetail() {
             <Input.TextArea rows={2} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="确认相邻管线状态"
+        open={pipelineModal}
+        onCancel={() => setPipelineModal(false)}
+        width={500}
+        footer={[
+          <Button key="cancel" onClick={() => setPipelineModal(false)}>取消</Button>,
+          <Button
+            key="submit"
+            type="primary"
+            loading={loading}
+            onClick={async () => {
+              try {
+                setLoading(true)
+                const values = await pipelineForm.validateFields()
+                await confirmPipeline(pipelineForm.pipelineId, {
+                  ...values,
+                  has_leak: values.has_leak === 1,
+                })
+                setPipelineModal(false)
+                pipelineForm.resetFields()
+              } catch (e) {
+                message.error(e.response?.data?.error || '确认失败')
+              } finally {
+                setLoading(false)
+              }
+            }}
+          >
+            确认状态
+          </Button>,
+        ]}
+      >
+        <Alert
+          style={{ marginBottom: 16 }}
+          message="重要提醒"
+          description="请现场核实管线压力状态和是否有泄漏，确认无误后再提交。"
+          type="warning"
+          showIcon
+        />
+        <Form form={pipelineForm} layout="vertical">
+          <Form.Item label="压力状态" name="pressure_status" rules={[{ required: true }]}>
+            <Select>
+              {PRESSURE_STATUS_OPTIONS.map(o => <Option key={o.value} value={o.value}>{o.label}</Option>)}
+            </Select>
+          </Form.Item>
+          <Form.Item label="是否有泄漏" name="has_leak" rules={[{ required: true }]}>
+            <Select>
+              <Option value={0}>无泄漏（安全）</Option>
+              <Option value={1}>有泄漏（危险）</Option>
+            </Select>
+          </Form.Item>
+          <Form.Item label="确认备注" name="remark">
+            <Input.TextArea rows={2} placeholder="请输入现场确认情况" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="确认复工"
+        open={resumeModal}
+        onCancel={() => setResumeModal(false)}
+        width={600}
+        footer={[
+          <Button key="cancel" onClick={() => setResumeModal(false)}>取消</Button>,
+          <Button key="submit" type="primary" loading={loading} onClick={handleConfirmResume}>
+            确认复工
+          </Button>,
+        ]}
+      >
+        <Alert
+          style={{ marginBottom: 16 }}
+          type="warning"
+          showIcon
+          message="复工前联锁检查"
+          description={
+            <div>
+              <div>• 隔离盲板：{ticket.blindPlates.every(b => b.installed) ? '✅ 全部确认安装' : '❌ 存在未确认盲板'}</div>
+              <div>• 相邻管线：{(ticket.adjacentPipelines?.every(p => p.confirmed)) ? '✅ 全部确认状态' : '❌ 存在未确认管线'}</div>
+              <div>• 气体检测：{latestDetection?.is_qualified ? '✅ 最近检测合格' : '❌ 最近检测不合格'}</div>
+              <div style={{ marginTop: 8, color: '#ff4d4f', fontWeight: 600 }}>
+                确认人：{currentUserName}（{ROLE_NAMES[currentRole]}）
+              </div>
+            </div>
+          }
+        />
+        <Form form={resumeForm} layout="vertical">
+          <Form.Item
+            label="复工确认说明"
+            name="resume_remark"
+            rules={[{ required: true, message: '请输入复工确认说明' }]}
+          >
+            <Input.TextArea
+              rows={3}
+              placeholder="请说明已确认所有安全条件满足，可以恢复作业"
+            />
+          </Form.Item>
+          <Form.Item
+            label="本人已确认"
+            name="confirmed"
+            valuePropName="checked"
+            rules={[
+              {
+                validator: (_, value) =>
+                  value ? Promise.resolve() : Promise.reject(new Error('请勾选确认')),
+              },
+            ]}
+          >
+            <Switch
+              checkedChildren="已确认"
+              unCheckedChildren="未确认"
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="暂停时检测曲线"
+        open={curveModal}
+        onCancel={() => setCurveModal(false)}
+        width={900}
+        footer={[
+          <Button key="close" onClick={() => setCurveModal(false)}>关闭</Button>,
+        ]}
+      >
+        {selectedPauseRecord?.detection_curve_data && (
+          <ReactECharts
+            option={(() => {
+              const data = JSON.parse(selectedPauseRecord.detection_curve_data)
+              return {
+                title: { text: '暂停时气体检测趋势曲线', left: 'center' },
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['可燃气体(%LEL)', '氧含量(%)'], top: 30 },
+                grid: { left: 60, right: 60, top: 80, bottom: 60 },
+                xAxis: {
+                  type: 'category',
+                  data: [...data.timeline, data.current_detection].map(d =>
+                    dayjs(d.time).format('HH:mm:ss')
+                  ),
+                  axisLabel: { rotate: 30 },
+                },
+                yAxis: [
+                  { type: 'value', name: '可燃%', position: 'left' },
+                  { type: 'value', name: '氧含量%', position: 'right' },
+                ],
+                series: [
+                  {
+                    name: '可燃气体(%LEL)',
+                    type: 'line',
+                    smooth: true,
+                    yAxisIndex: 0,
+                    data: [...data.timeline, data.current_detection].map((d, i) => ({
+                      value: d.combustible,
+                      itemStyle: i === data.timeline.length ? { color: '#ff4d4f', borderWidth: 3 } : undefined,
+                    })),
+                    itemStyle: { color: '#ff4d4f' },
+                    areaStyle: { opacity: 0.2, color: '#ff4d4f' },
+                    markLine: {
+                      silent: true,
+                      lineStyle: { color: '#ff4d4f', type: 'dashed' },
+                      data: [{ yAxis: data.limits.combustible_limit, label: { formatter: `上限 ${data.limits.combustible_limit}%` } }],
+                    },
+                    markPoint: {
+                      symbol: 'pin',
+                      symbolSize: 50,
+                      data: [{
+                        coord: [data.timeline.length, data.current_detection.combustible],
+                        value: '超限',
+                        itemStyle: { color: '#ff4d4f' },
+                      }],
+                      label: { color: '#fff', fontWeight: 'bold' },
+                    },
+                  },
+                  {
+                    name: '氧含量(%)',
+                    type: 'line',
+                    smooth: true,
+                    yAxisIndex: 1,
+                    data: [...data.timeline, data.current_detection].map(d => d.oxygen),
+                    itemStyle: { color: '#1890ff' },
+                    areaStyle: { opacity: 0.2, color: '#1890ff' },
+                    markLine: {
+                      silent: true,
+                      lineStyle: { color: '#faad14', type: 'dashed' },
+                      data: [
+                        { yAxis: data.limits.oxygen_min, label: { formatter: `下限 ${data.limits.oxygen_min}%` } },
+                        { yAxis: data.limits.oxygen_max, label: { formatter: `上限 ${data.limits.oxygen_max}%` } },
+                      ],
+                    },
+                  },
+                ],
+              }
+            })()}
+            style={{ height: 400 }}
+          />
+        )}
+        {!selectedPauseRecord?.detection_curve_data && (
+          <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>
+            暂无检测曲线数据
+          </div>
+        )}
       </Modal>
 
       <Modal

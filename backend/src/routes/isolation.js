@@ -30,15 +30,29 @@ router.post('/:plateId/confirm-install', (req, res) => {
   `).run(confirmed_by || 'territory_manager', req.params.plateId);
 
   const ticket = db.prepare('SELECT * FROM work_tickets WHERE id = ?').get(plate.ticket_id);
-  const remaining = db.prepare(`
+  const remainingPlates = db.prepare(`
     SELECT COUNT(*) as count FROM isolation_blind_plates
     WHERE ticket_id = ? AND installed = 0
   `).get(plate.ticket_id);
 
-  if (remaining.count === 0 && ticket.status === 'pending_isolation') {
+  const remainingPipelines = db.prepare(`
+    SELECT COUNT(*) as count FROM adjacent_pipelines
+    WHERE ticket_id = ? AND confirmed = 0
+  `).get(plate.ticket_id);
+
+  if (remainingPlates.count === 0 && remainingPipelines.count === 0 && ticket.status === 'pending_isolation') {
     db.prepare(`
       UPDATE work_tickets SET
         status = 'pending_detection',
+        isolation_confirmed_at = CURRENT_TIMESTAMP,
+        isolation_confirmed_by = ?,
+        pipeline_confirmed_at = CURRENT_TIMESTAMP,
+        pipeline_confirmed_by = ?
+      WHERE id = ?
+    `).run(confirmed_by || 'territory_manager', confirmed_by || 'territory_manager', plate.ticket_id);
+  } else if (remainingPlates.count === 0 && ticket.status === 'pending_isolation') {
+    db.prepare(`
+      UPDATE work_tickets SET
         isolation_confirmed_at = CURRENT_TIMESTAMP,
         isolation_confirmed_by = ?
       WHERE id = ?

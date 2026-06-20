@@ -12,6 +12,7 @@ if (!fs.existsSync(dbDir)) {
 const defaultData = {
   work_tickets: [],
   isolation_blind_plates: [],
+  adjacent_pipelines: [],
   gas_detections: [],
   responsible_persons: [],
   operation_logs: [],
@@ -25,6 +26,15 @@ const COLUMN_DEFAULTS = {
     combustible_limit: 0.5,
     oxygen_min: 19.5,
     oxygen_max: 23.5,
+    is_locked: 0,
+    lock_type: null,
+    lock_reason: null,
+    locked_at: null,
+    pipeline_confirmed_by: null,
+    pipeline_confirmed_at: null,
+    last_retest_at: null,
+    resume_confirmed_by: null,
+    resume_confirmed_at: null,
   },
   isolation_blind_plates: {
     installed: 0,
@@ -32,9 +42,17 @@ const COLUMN_DEFAULTS = {
     confirmed_by: null,
     confirmed_at: null,
   },
+  adjacent_pipelines: {
+    confirmed: 0,
+    confirmed_by: null,
+    confirmed_at: null,
+    pressure_status: 'normal',
+    has_leak: 0,
+  },
   gas_detections: {
     is_qualified: 1,
     remark: '',
+    is_retest: 0,
   },
   responsible_persons: {
     confirmed_at: null,
@@ -44,6 +62,10 @@ const COLUMN_DEFAULTS = {
     resumed_at: null,
     resumed_by: null,
     resume_remark: '',
+    detection_curve_data: null,
+    resume_confirmed_by: null,
+    resume_confirmed_at: null,
+    retest_detection_id: null,
   },
 };
 
@@ -322,8 +344,22 @@ class Table {
       rec.installed = normalizeValueForCompare(rec.installed);
       rec.removed = normalizeValueForCompare(rec.removed);
     }
-    if (this.tableName === 'gas_detections' && rec.is_qualified !== undefined) {
-      rec.is_qualified = normalizeValueForCompare(rec.is_qualified);
+    if (this.tableName === 'adjacent_pipelines') {
+      rec.confirmed = normalizeValueForCompare(rec.confirmed);
+      rec.has_leak = normalizeValueForCompare(rec.has_leak);
+    }
+    if (this.tableName === 'gas_detections') {
+      if (rec.is_qualified !== undefined) {
+        rec.is_qualified = normalizeValueForCompare(rec.is_qualified);
+      }
+      if (rec.is_retest !== undefined) {
+        rec.is_retest = normalizeValueForCompare(rec.is_retest);
+      }
+    }
+    if (this.tableName === 'work_tickets') {
+      if (rec.is_locked !== undefined) {
+        rec.is_locked = normalizeValueForCompare(rec.is_locked);
+      }
     }
 
     data[this.tableName].push(rec);
@@ -358,6 +394,7 @@ class Table {
 const tables = {
   work_tickets: new Table('work_tickets'),
   isolation_blind_plates: new Table('isolation_blind_plates'),
+  adjacent_pipelines: new Table('adjacent_pipelines'),
   gas_detections: new Table('gas_detections'),
   responsible_persons: new Table('responsible_persons'),
   operation_logs: new Table('operation_logs'),

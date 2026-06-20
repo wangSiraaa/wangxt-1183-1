@@ -61,7 +61,8 @@ router.post('/ticket/:ticketId', (req, res) => {
     detector,
     detector_name,
     detector_role = 'safety_guardian',
-    remark
+    remark,
+    is_retest = 0
   } = req.body;
 
   const point = detection_point || detectionPoint || '默认检测点';
@@ -84,12 +85,14 @@ router.post('/ticket/:ticketId', (req, res) => {
     oxygen <= ticket.oxygen_max;
 
   const id = uuidv4();
+  let detectionCurveData = null;
+
   const tx = db.transaction(() => {
     db.prepare(`
       INSERT INTO gas_detections (
         id, ticket_id, detection_point, combustible_content,
-        oxygen_content, detector, detector_role, is_qualified, remark
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        oxygen_content, detector, detector_role, is_qualified, remark, is_retest
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, req.params.ticketId, point,
       parseFloat(combustible),
@@ -97,7 +100,8 @@ router.post('/ticket/:ticketId', (req, res) => {
       detectorName || detector || 'safety_guardian_user',
       detector_role,
       isQualified ? 1 : 0,
-      remark || ''
+      remark || '',
+      is_retest ? 1 : 0
     );
 
     if (isQualified) {
@@ -105,7 +109,7 @@ router.post('/ticket/:ticketId', (req, res) => {
         UPDATE work_tickets SET
           gas_qualified_at = CURRENT_TIMESTAMP,
           gas_qualified_by = ?,
-          locked_reason = NULL
+          last_retest_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `).run(detectorName || detector || 'safety_guardian_user', req.params.ticketId);
 
@@ -115,34 +119,91 @@ router.post('/ticket/:ticketId', (req, res) => {
           WHERE ticket_id = ? AND installed = 0
         `).get(req.params.ticketId);
 
-        if (unconfirmed.count === 0) {
+        const unconfirmedPipelines = db.prepare(`
+          SELECT COUNT(*) as count FROM adjacent_pipelines
+          WHERE ticket_id = ? AND confirmed = 0
+        `).get(req.params.ticketId);
+
+        if (unconfirmed.count === 0 && unconfirmedPipelines.count === 0) {
           db.prepare(`UPDATE work_tickets SET status = 'ready' WHERE id = ?`).run(req.params.ticketId);
         }
       }
 
-      if (ticket.status === 'paused' || ticket.status === 'in_progress') {
+      if (ticket.status === 'paused' && !ticket.is_locked) {
         db.prepare(`UPDATE work_tickets SET status = 'ready' WHERE id = ?`).run(req.params.ticketId);
+      }
+
+      if (ticket.is_locked && ticket.lock_type === 'retest_timeout') {
+        db.prepare(`
+          UPDATE work_tickets SET
+            locked_reason = '复测已合格，请监护人确认复工'
+          WHERE id = ?
+        `).run(req.params.ticketId);
       }
     }
 
-    if (!isQualified && (ticket.status === 'in_progress' || ticket.status === 'ready')) {
+    if (!isQualified && (ticket.status === 'in_progress' || ticket.status === 'ready' || (ticket.status === 'paused' && !ticket.is_locked))) {
+      const recentDetections = db.prepare(`
+        SELECT
+          id,
+          created_at,
+          detection_point,
+          combustible_content,
+          oxygen_content,
+          is_qualified
+        FROM gas_detections
+        WHERE ticket_id = ? ORDER BY created_at ASC
+      `).all(req.params.ticketId);
+
+      detectionCurveData = JSON.stringify({
+        timeline: recentDetections.map(d => ({
+          time: d.created_at,
+          combustible: d.combustible_content,
+          oxygen: d.oxygen_content,
+          point: d.detection_point,
+          qualified: d.is_qualified === 1 || d.is_qualified === true
+        })),
+        current_detection: {
+          time: new Date().toISOString(),
+          combustible: parseFloat(combustible),
+          oxygen: parseFloat(oxygen),
+          point,
+          qualified: false
+        },
+        limits: {
+          combustible_limit: ticket.combustible_limit,
+          oxygen_min: ticket.oxygen_min,
+          oxygen_max: ticket.oxygen_max
+        }
+      });
+
       db.prepare(`
         UPDATE work_tickets SET
           status = 'paused',
+          is_locked = 1,
+          lock_type = 'gas_exceed',
+          lock_reason = ?,
           paused_at = CURRENT_TIMESTAMP,
-          pause_reason = ?
+          pause_reason = ?,
+          locked_at = CURRENT_TIMESTAMP
         WHERE id = ?
-      `).run('气体检测超限自动暂停', req.params.ticketId);
+      `).run(
+        `气体检测超限自动暂停：可燃 ${combustible}% LEL / 氧 ${oxygen}%，请复测合格后确认复工`,
+        '气体检测超限自动暂停',
+        req.params.ticketId
+      );
 
       db.prepare(`
         INSERT INTO pause_records (
-          id, ticket_id, pause_type, pause_reason, paused_by
-        ) VALUES (?, ?, ?, ?, ?)
+          id, ticket_id, pause_type, pause_reason, paused_by,
+          detection_curve_data
+        ) VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         uuidv4(), req.params.ticketId,
         'auto_gas_exceed',
         `气体检测超限：可燃 ${combustible}% LEL / 氧 ${oxygen}%`,
-        'system'
+        'system',
+        detectionCurveData
       );
     }
 
@@ -152,7 +213,7 @@ router.post('/ticket/:ticketId', (req, res) => {
     `).run(
       uuidv4(), req.params.ticketId, 'gas_detection',
       detectorName || detector || 'safety_guardian_user', detector_role,
-      `气体检测：${point} 可燃${combustible}% 氧${oxygen}% ${isQualified ? '合格' : '不合格'}`
+      `气体${is_retest ? '复测' : '检测'}：${point} 可燃${combustible}% 氧${oxygen}% ${isQualified ? '合格' : '不合格'}`
     );
   });
 
@@ -165,7 +226,11 @@ router.post('/ticket/:ticketId', (req, res) => {
     detection,
     ticket_status: updatedTicket.status,
     is_qualified: isQualified,
+    is_locked: updatedTicket.is_locked === 1,
+    lock_type: updatedTicket.lock_type,
+    lock_reason: updatedTicket.lock_reason,
     auto_paused: !isQualified && (ticket.status === 'in_progress' || ticket.status === 'ready'),
+    needs_resume_confirm: updatedTicket.is_locked === 1 && isQualified,
     ticket_id: ticket.id
   });
 });

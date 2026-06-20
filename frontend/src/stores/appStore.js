@@ -36,6 +36,19 @@ export const STATUS_COLORS = {
   cancelled: 'gray',
 }
 
+export const LOCK_TYPE_NAMES = {
+  gas_exceed: '气体检测超限锁定',
+  retest_timeout: '复测超时锁定',
+  manual: '人工锁定',
+}
+
+export const PRESSURE_STATUS_OPTIONS = [
+  { value: 'normal', label: '正常压力' },
+  { value: 'low', label: '低压' },
+  { value: 'depressurized', label: '已泄压' },
+  { value: 'unknown', label: '未知' },
+]
+
 const useAppStore = create((set, get) => ({
   currentRole: ROLES.CONTRACTOR,
   currentUser: 'contractor_user_01',

@@ -70,13 +70,29 @@ router.post('/ticket/:ticketId/resume', (req, res) => {
     return res.status(404).json({ error: '作业票不存在' });
   }
 
-  const unconfirmed = db.prepare(`
+  if (ticket.is_locked) {
+    return res.status(400).json({
+      error: '作业票已锁定，请先通过"确认复工"流程解除锁定',
+      lock_reason: ticket.lock_reason
+    });
+  }
+
+  const unconfirmedPlates = db.prepare(`
     SELECT COUNT(*) as count FROM isolation_blind_plates
     WHERE ticket_id = ? AND installed = 0
   `).get(req.params.ticketId);
 
-  if (unconfirmed.count > 0) {
+  if (unconfirmedPlates.count > 0) {
     return res.status(400).json({ error: '隔离盲板未确认，无法恢复作业' });
+  }
+
+  const unconfirmedPipelines = db.prepare(`
+    SELECT COUNT(*) as count FROM adjacent_pipelines
+    WHERE ticket_id = ? AND confirmed = 0
+  `).get(req.params.ticketId);
+
+  if (unconfirmedPipelines.count > 0) {
+    return res.status(400).json({ error: '相邻管线未确认状态，无法恢复作业' });
   }
 
   const latestDetection = db.prepare(`
@@ -94,18 +110,28 @@ router.post('/ticket/:ticketId/resume', (req, res) => {
       UPDATE pause_records SET
         resumed_at = CURRENT_TIMESTAMP,
         resumed_by = ?,
-        resume_remark = ?
+        resume_remark = ?,
+        resume_confirmed_by = ?,
+        resume_confirmed_at = CURRENT_TIMESTAMP
       WHERE ticket_id = ? AND resumed_at IS NULL
       ORDER BY created_at DESC LIMIT 1
-    `).run(resumed_by || 'safety_guardian_user', resume_remark || '', req.params.ticketId);
+    `).run(
+      resumed_by || 'safety_guardian_user',
+      resume_remark || '',
+      resumed_by || 'safety_guardian_user',
+      req.params.ticketId
+    );
 
     db.prepare(`
       UPDATE work_tickets SET
-        status = 'ready',
+        status = 'in_progress',
         paused_at = NULL,
-        pause_reason = NULL
+        pause_reason = NULL,
+        last_retest_at = CURRENT_TIMESTAMP,
+        resume_confirmed_by = ?,
+        resume_confirmed_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).run(req.params.ticketId);
+    `).run(resumed_by || 'safety_guardian_user', req.params.ticketId);
 
     db.prepare(`
       INSERT INTO operation_logs (id, ticket_id, operation_type, operator, operator_role, detail)
@@ -120,7 +146,11 @@ router.post('/ticket/:ticketId/resume', (req, res) => {
   tx();
 
   const updatedTicket = db.prepare('SELECT * FROM work_tickets WHERE id = ?').get(req.params.ticketId);
-  res.json({ ticket_status: updatedTicket.status });
+  res.json({
+    ticket_status: updatedTicket.status,
+    is_locked: updatedTicket.is_locked,
+    message: '作业已恢复'
+  });
 });
 
 router.get('/active/list', (req, res) => {

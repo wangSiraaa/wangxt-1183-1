@@ -8,6 +8,7 @@ const ticketRoutes = require('./routes/tickets');
 const isolationRoutes = require('./routes/isolation');
 const detectionRoutes = require('./routes/detection');
 const pauseRoutes = require('./routes/pause');
+const pipelineRoutes = require('./routes/pipelines');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -26,6 +27,7 @@ app.use('/api/tickets', ticketRoutes);
 app.use('/api/isolation', isolationRoutes);
 app.use('/api/detection', detectionRoutes);
 app.use('/api/pause', pauseRoutes);
+app.use('/api/pipelines', pipelineRoutes);
 
 app.use((err, req, res, next) => {
   console.error('Server error:', err);

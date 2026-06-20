@@ -1,15 +1,15 @@
 import { useState } from 'react'
 import {
   Card, Form, Input, InputNumber, DatePicker, Select, Button, Space, Table,
-  Modal, Row, Col, Divider, message, List, Tag,
+  Modal, Row, Col, Divider, message, List, Tag, Switch,
 } from 'antd'
 import {
-  PlusOutlined, SaveOutlined, FireOutlined, UserOutlined, DeleteOutlined,
+  PlusOutlined, SaveOutlined, FireOutlined, UserOutlined, DeleteOutlined, AlertOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import dayjs from 'dayjs'
 import { ticketApi } from '../services/api'
-import useAppStore, { ROLES, ROLE_NAMES } from '../stores/appStore'
+import useAppStore, { ROLES, ROLE_NAMES, PRESSURE_STATUS_OPTIONS } from '../stores/appStore'
 
 const { TextArea } = Input
 const { Option } = Select
@@ -30,15 +30,37 @@ const defaultResponsiblePersons = [
   { role: ROLES.SAFETY_GUARDIAN, person_name: '王五', person_id: 'S001' },
 ]
 
+const defaultAdjacentPipelines = [
+  {
+    pipeline_name: '相邻进料管道A',
+    location: '动火点东侧5米',
+    medium: '柴油',
+    pressure_status: 'normal',
+    has_leak: false,
+    remark: '正常运行中，无泄漏',
+  },
+  {
+    pipeline_name: '相邻放空管道B',
+    location: '动火点南侧3米',
+    medium: '废气',
+    pressure_status: 'depressurized',
+    has_leak: false,
+    remark: '已泄压隔离',
+  },
+]
+
 function TicketCreate() {
   const [form] = Form.useForm()
   const navigate = useNavigate()
   const { currentUser } = useAppStore()
   const [blindPlates, setBlindPlates] = useState(defaultBlindPlates)
+  const [adjacentPipelines, setAdjacentPipelines] = useState(defaultAdjacentPipelines)
   const [persons, setPersons] = useState(defaultResponsiblePersons)
   const [plateModal, setPlateModal] = useState(false)
+  const [pipelineModal, setPipelineModal] = useState(false)
   const [personModal, setPersonModal] = useState(false)
   const [plateForm] = Form.useForm()
+  const [pipelineForm] = Form.useForm()
   const [personForm] = Form.useForm()
   const [submitting, setSubmitting] = useState(false)
 
@@ -57,6 +79,7 @@ function TicketCreate() {
         end_time: values.work_time[1].toISOString(),
         created_by: currentUser,
         blind_plates: blindPlates,
+        adjacent_pipelines: adjacentPipelines,
         responsible_persons: persons,
       })
       message.success('作业票创建成功')
@@ -78,6 +101,29 @@ function TicketCreate() {
       render: (_, __, i) => (
         <Button type="link" danger icon={<DeleteOutlined />} onClick={() => {
           setBlindPlates(prev => prev.filter((_, idx) => idx !== i))
+        }}>删除</Button>
+      ),
+    },
+  ]
+
+  const pipelineColumns = [
+    { title: '管线名称', dataIndex: 'pipeline_name', width: 160 },
+    { title: '位置', dataIndex: 'location', width: 140 },
+    { title: '介质', dataIndex: 'medium', width: 120 },
+    {
+      title: '压力状态', dataIndex: 'pressure_status', width: 120,
+      render: v => PRESSURE_STATUS_OPTIONS.find(o => o.value === v)?.label || v,
+    },
+    {
+      title: '是否泄漏', dataIndex: 'has_leak', width: 100,
+      render: v => <Tag color={v ? 'red' : 'green'}>{v ? '是' : '否'}</Tag>,
+    },
+    { title: '备注', dataIndex: 'remark' },
+    {
+      title: '操作', width: 80,
+      render: (_, __, i) => (
+        <Button type="link" danger icon={<DeleteOutlined />} onClick={() => {
+          setAdjacentPipelines(prev => prev.filter((_, idx) => idx !== i))
         }}>删除</Button>
       ),
     },
@@ -202,6 +248,24 @@ function TicketCreate() {
 
       <Card
         className="page-card"
+        title={<span><AlertOutlined /> 相邻管线清单</span>}
+        style={{ marginBottom: 16, border: '2px solid #1890ff' }}
+        extra={<Button icon={<PlusOutlined />} onClick={() => setPipelineModal(true)}>添加管线</Button>}
+      >
+        <p style={{ color: '#666', marginBottom: 12 }}>
+          请列出所有与动火作业相关的相邻管线，包括运行中和已停运的管线。属地负责人需逐项确认管线压力状态和是否有泄漏。
+        </p>
+        <Table
+          columns={pipelineColumns}
+          dataSource={adjacentPipelines}
+          rowKey={(r, i) => `${r.pipeline_name}_${i}`}
+          pagination={false}
+          size="middle"
+        />
+      </Card>
+
+      <Card
+        className="page-card"
         title={<span><UserOutlined /> 责任人清单</span>}
         extra={<Button icon={<PlusOutlined />} onClick={() => setPersonModal(true)}>添加责任人</Button>}
       >
@@ -237,6 +301,60 @@ function TicketCreate() {
           </Form.Item>
           <Form.Item label="介质" name="medium">
             <Input placeholder="如：天然气、蒸汽等" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="添加相邻管线"
+        open={pipelineModal}
+        onCancel={() => setPipelineModal(false)}
+        onOk={async () => {
+          const vals = await pipelineForm.validateFields()
+          setAdjacentPipelines(prev => [...prev, {
+            ...vals,
+            has_leak: vals.has_leak === 1,
+          }])
+          pipelineForm.resetFields()
+          setPipelineModal(false)
+        }}
+        width={600}
+      >
+        <Form form={pipelineForm} layout="vertical">
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item label="管线名称" name="pipeline_name" rules={[{ required: true }]}>
+                <Input placeholder="如：相邻进料管道A" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item label="位置" name="location" rules={[{ required: true }]}>
+                <Input placeholder="如：动火点东侧5米" />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item label="介质" name="medium" rules={[{ required: true }]}>
+                <Input placeholder="如：柴油、天然气" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item label="压力状态" name="pressure_status" initialValue="normal" rules={[{ required: true }]}>
+                <Select>
+                  {PRESSURE_STATUS_OPTIONS.map(o => <Option key={o.value} value={o.value}>{o.label}</Option>)}
+                </Select>
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item label="是否有泄漏" name="has_leak" initialValue={0} rules={[{ required: true }]}>
+            <Select>
+              <Option value={0}>无泄漏</Option>
+              <Option value={1}>有泄漏</Option>
+            </Select>
+          </Form.Item>
+          <Form.Item label="备注" name="remark">
+            <TextArea rows={2} placeholder="请输入管线状态说明" />
           </Form.Item>
         </Form>
       </Modal>
